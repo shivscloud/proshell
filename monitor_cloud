@@ -1,6 +1,6 @@
 import boto3
 import csv
-import os
+import io
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -61,20 +61,25 @@ def main(event, context):
                 'body': f'No IAM policy changes found between {start_time_str} and {end_time_str}.'
             }
         
-        # Prepare CSV data
-        csv_rows = []
+        # Prepare CSV data in memory
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        
+        # Write headers
         headers = [
             'AccountID', 'Region', 'ResourceID', 'ResourceType', 
             'CaptureTime', 'Status', 'StateID', 'ChangeType', 'ChangedProperties'
         ]
+        writer.writerow(headers)
         
+        # Write data rows
         for result in results:
             item = json.loads(result)
             diff = item.get('configurationItemDiff', {})
             change_type = diff.get('changeType', 'N/A')
             changed_properties = ', '.join(diff.get('changedProperties', []))
             
-            csv_rows.append([
+            writer.writerow([
                 item.get('awsAccountId', 'N/A'),
                 item.get('awsRegion', 'N/A'),
                 item.get('resourceId', 'N/A'),
@@ -86,26 +91,19 @@ def main(event, context):
                 changed_properties
             ])
         
-        # Write to CSV in memory
-        csv_buffer = []
-        writer = csv.writer(csv_buffer)
-        writer.writerow(headers)
-        writer.writerows(csv_rows)
-        csv_content = '\n'.join(csv_buffer)
-        
         # Upload to S3
         s3_client.put_object(
             Bucket=s3_bucket,
             Key=s3_key,
-            Body=csv_content
+            Body=csv_buffer.getvalue()
         )
         
-        print(f"Successfully saved {len(csv_rows)} IAM policy changes to s3://{s3_bucket}/{s3_key}")
+        print(f"Successfully saved {len(results)} IAM policy changes to s3://{s3_bucket}/{s3_key}")
         print(f"Time range: {start_time_str} to {end_time_str}")
         
         return {
             'statusCode': 200,
-            'body': f"Successfully processed {len(csv_rows)} IAM policy changes from last 7 days.",
+            'body': f"Successfully processed {len(results)} IAM policy changes from last 7 days.",
             's3_location': f"s3://{s3_bucket}/{s3_key}",
             'time_range': {
                 'start': start_time_str,
