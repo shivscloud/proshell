@@ -8,28 +8,30 @@ def main(event, context):
     # Initialize clients
     config_client = boto3.client('config')
     s3_client = boto3.client('s3')
+    athena_client = boto3.client('athena')
     
     # Configuration - update these values as needed
-    aggregator_name = 'YourConfigAggregatorName'  # Replace with your aggregator name
-    s3_bucket = 'your-log-bucket-name'           # Replace with your S3 bucket
-    s3_key_prefix = 'iam-policy-changes/'        # Replace with desired prefix
+    aggregator_name = 'YourConfigAggregatorName'
+    s3_bucket = 'your-log-bucket-name'
+    s3_key_prefix = 'iam-policy-changes/'
+    athena_database = 'cloudtrail_logs'
+    athena_table = 'cloudtrail_logs_partition_projection'
+    athena_output_location = 's3://your-athena-query-results/'
     
     # Calculate date range (last 7 days)
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=7)
-    
-    # Format dates for query
     start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     
     # Generate timestamp for the filename
     timestamp = end_time.strftime('%Y-%m-%d_%H-%M-%S')
-    filename = f'iam_policy_changes_last7days_{timestamp}.csv'
+    filename = f'filtered_iam_policy_changes_{timestamp}.csv'
     s3_key = f'{s3_key_prefix}{filename}'
     
     try:
-        # Query AWS Config for IAM policy changes in last 7 days
-        response = config_client.select_aggregate_resource_config(
+        # Step 1: Get IAM policy changes from AWS Config
+        config_response = config_client.select_aggregate_resource_config(
             Expression=f"""
                 SELECT
                     resourceId,
@@ -48,12 +50,10 @@ def main(event, context):
                     configurationItemCaptureTime DESC
             """,
             ConfigurationAggregatorName=aggregator_name,
-            Limit=1000  # Adjust based on expected volume
+            Limit=1000
         )
         
-        # Process the results
-        results = response.get('Results', [])
-        
+        results = config_response.get('Results', [])
         if not results:
             print(f"No IAM policy changes found between {start_time_str} and {end_time_str}.")
             return {
@@ -68,48 +68,142 @@ def main(event, context):
         # Write headers
         headers = [
             'AccountID', 'Region', 'ResourceID', 'ResourceType', 
-            'CaptureTime', 'Status', 'StateID', 'ChangeType', 'ChangedProperties'
+            'CaptureTime', 'Status', 'StateID', 'ChangeType', 
+            'ChangedProperties', 'InitiatorArn', 'InitiatorType',
+            'CloudTrailEventTime', 'EventName'
         ]
         writer.writerow(headers)
         
-        # Write data rows
+        # Process each IAM policy change
         for result in results:
             item = json.loads(result)
             diff = item.get('configurationItemDiff', {})
             change_type = diff.get('changeType', 'N/A')
             changed_properties = ', '.join(diff.get('changedProperties', []))
             
+            # Step 2: Query CloudTrail to find who made this change
+            resource_id = item.get('resourceId', 'N/A')
+            capture_time = item.get('configurationItemCaptureTime', 'N/A')
+            
+            # Convert Config capture time to match CloudTrail format
+            try:
+                event_time = datetime.strptime(capture_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                cloudtrail_start = (event_time - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+                cloudtrail_end = (event_time + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                cloudtrail_start = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+                cloudtrail_end = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Athena query to find the CloudTrail event
+            query = f"""
+                SELECT
+                    useridentity.arn as initiator_arn,
+                    useridentity.type as initiator_type,
+                    eventtime as cloudtrail_event_time,
+                    eventname
+                FROM {athena_database}.{athena_table}
+                WHERE
+                    eventtime >= timestamp '{cloudtrail_start}'
+                    AND eventtime <= timestamp '{cloudtrail_end}'
+                    AND resources ARRAY_CONTAINS(MAP(ARRAY['ARN'], ARRAY['{resource_id}']))
+                    AND eventsource = 'iam.amazonaws.com'
+                ORDER BY eventtime DESC
+                LIMIT 1
+            """
+            
+            # Execute Athena query
+            query_execution = athena_client.start_query_execution(
+                QueryString=query,
+                QueryExecutionContext={
+                    'Database': athena_database
+                },
+                ResultConfiguration={
+                    'OutputLocation': athena_output_location
+                }
+            )
+            
+            query_execution_id = query_execution['QueryExecutionId']
+            
+            # Wait for query to complete
+            while True:
+                status = athena_client.get_query_execution(
+                    QueryExecutionId=query_execution_id
+                )
+                state = status['QueryExecution']['Status']['State']
+                if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                    break
+            
+            if state != 'SUCCEEDED':
+                print(f"Athena query failed for resource {resource_id}")
+                initiator_arn = 'QUERY_FAILED'
+                initiator_type = 'QUERY_FAILED'
+                cloudtrail_event_time = 'QUERY_FAILED'
+                event_name = 'QUERY_FAILED'
+            else:
+                # Get query results
+                results = athena_client.get_query_results(
+                    QueryExecutionId=query_execution_id
+                )
+                
+                if len(results['ResultSet']['Rows']) > 1:  # First row is headers
+                    row = results['ResultSet']['Rows'][1]['Data']
+                    initiator_arn = row[0].get('VarCharValue', 'NOT_FOUND')
+                    initiator_type = row[1].get('VarCharValue', 'NOT_FOUND')
+                    cloudtrail_event_time = row[2].get('VarCharValue', 'NOT_FOUND')
+                    event_name = row[3].get('VarCharValue', 'NOT_FOUND')
+                else:
+                    initiator_arn = 'NOT_FOUND'
+                    initiator_type = 'NOT_FOUND'
+                    cloudtrail_event_time = 'NOT_FOUND'
+                    event_name = 'NOT_FOUND'
+            
+            # Step 3: Filter out CloudFormation stack execution roles
+            if 'cloudformationstacksetexecutionrole' in initiator_arn.lower():
+                print(f"Skipping CloudFormation-initiated change for {resource_id}")
+                continue
+            
+            # Write to CSV only if not from CloudFormation
             writer.writerow([
                 item.get('awsAccountId', 'N/A'),
                 item.get('awsRegion', 'N/A'),
                 item.get('resourceId', 'N/A'),
                 item.get('resourceType', 'N/A'),
-                item.get('configurationItemCaptureTime', 'N/A'),
+                capture_time,
                 item.get('configurationItemStatus', 'N/A'),
                 item.get('configurationStateId', 'N/A'),
                 change_type,
-                changed_properties
+                changed_properties,
+                initiator_arn,
+                initiator_type,
+                cloudtrail_event_time,
+                event_name
             ])
         
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=s3_bucket,
-            Key=s3_key,
-            Body=csv_buffer.getvalue()
-        )
-        
-        print(f"Successfully saved {len(results)} IAM policy changes to s3://{s3_bucket}/{s3_key}")
-        print(f"Time range: {start_time_str} to {end_time_str}")
-        
-        return {
-            'statusCode': 200,
-            'body': f"Successfully processed {len(results)} IAM policy changes from last 7 days.",
-            's3_location': f"s3://{s3_bucket}/{s3_key}",
-            'time_range': {
-                'start': start_time_str,
-                'end': end_time_str
+        # Upload to S3 if we have any rows (header + at least one data row)
+        if csv_buffer.getvalue().count('\n') > 1:
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=s3_key,
+                Body=csv_buffer.getvalue()
+            )
+            
+            print(f"Successfully saved filtered IAM policy changes to s3://{s3_bucket}/{s3_key}")
+            
+            return {
+                'statusCode': 200,
+                'body': "Successfully processed IAM policy changes (excluding CloudFormation stack executions).",
+                's3_location': f"s3://{s3_bucket}/{s3_key}",
+                'time_range': {
+                    'start': start_time_str,
+                    'end': end_time_str
+                }
             }
-        }
+        else:
+            print("No relevant IAM policy changes found after filtering.")
+            return {
+                'statusCode': 200,
+                'body': "No relevant IAM policy changes found after filtering out CloudFormation stack executions."
+            }
         
     except Exception as e:
         print(f"Error processing IAM policy changes: {str(e)}")
