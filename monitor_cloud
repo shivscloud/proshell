@@ -1,254 +1,118 @@
 import boto3
-import pandas as pd
-from datetime import datetime, timedelta
-import time
 import csv
 import os
 import json
+from datetime import datetime, timezone, timedelta
 
-# Initialize AWS clients
-config_client = boto3.client('config')
-athena_client = boto3.client('athena')
-s3_client = boto3.client('s3')
-
-# Configuration from environment variables
-CONFIG_AGGREGATOR_NAME = os.environ['CONFIG_AGGREGATOR_NAME']
-ATHENA_DATABASE = os.environ['ATHENA_DATABASE']
-ATHENA_TABLE = os.environ['ATHENA_TABLE']
-OUTPUT_S3_BUCKET = os.environ['OUTPUT_S3_BUCKET']
-OUTPUT_S3_PREFIX = os.getenv('OUTPUT_S3_PREFIX', 'security-group-changes/')
-OUTPUT_CSV_FILE = os.getenv('OUTPUT_CSV_FILE', '/tmp/security_group_changes_with_users.csv')
-
-def run_config_aggregator_query(query):
-    """Run query against AWS Config aggregator and return results"""
-    response = config_client.select_aggregate_resource_config(
-        Expression=query,
-        ConfigurationAggregatorName=CONFIG_AGGREGATOR_NAME
-    )
+def main(event, context):
+    # Initialize clients
+    config_client = boto3.client('config')
+    s3_client = boto3.client('s3')
     
-    results = []
-    while True:
-        results.extend(response['Results'])
-        if 'NextToken' in response:
-            response = config_client.select_aggregate_resource_config(
-                Expression=query,
-                ConfigurationAggregatorName=CONFIG_AGGREGATOR_NAME,
-                NextToken=response['NextToken']
-            )
-        else:
-            break
+    # Configuration - update these values as needed
+    aggregator_name = 'YourConfigAggregatorName'  # Replace with your aggregator name
+    s3_bucket = 'your-log-bucket-name'           # Replace with your S3 bucket
+    s3_key_prefix = 'iam-policy-changes/'        # Replace with desired prefix
     
-    return [eval(item) for item in results]
-
-def run_athena_query(query, database, output_location):
-    """Run Athena query and return results"""
-    query_id = athena_client.start_query_execution(
-        QueryString=query,
-        QueryExecutionContext={
-            'Database': database
-        },
-        ResultConfiguration={
-            'OutputLocation': output_location
-        }
-    )['QueryExecutionId']
+    # Calculate date range (last 7 days)
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=7)
     
-    # Wait for query to complete
-    while True:
-        status = athena_client.get_query_execution(QueryExecutionId=query_id)
-        state = status['QueryExecution']['Status']['State']
-        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-            break
-        time.sleep(1)
+    # Format dates for query
+    start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     
-    if state != 'SUCCEEDED':
-        raise Exception(f'Athena query failed: {status}')
-    
-    # Get results
-    results = []
-    paginator = athena_client.get_paginator('get_query_results')
-    for page in paginator.paginate(QueryExecutionId=query_id):
-        results.extend(page['ResultSet']['Rows'])
-    
-    # Convert to list of dicts
-    if not results:
-        return []
-    
-    headers = [col['VarCharValue'] for col in results[0]['Data']]
-    return [
-        {header: col['VarCharValue'] for header, col in zip(headers, row['Data'])}
-        for row in results[1:]
-    ]
-
-def get_security_group_changes():
-    """Get security group changes from AWS Config"""
-    query = """
-    SELECT
-        resourceId,
-        awsRegion,
-        awsAccountId,
-        configurationItemCaptureTime,
-        configurationItemStatus,
-        configuration.eventName,
-        configuration.eventTime
-    WHERE
-        resourceType = 'AWS::EC2::SecurityGroup'
-        AND (
-            configurationItemStatus = 'ResourceDiscovered'
-            OR configurationItemStatus = 'OK'
-            OR configurationItemStatus = 'ResourceDeleted'
-        )
-        AND (
-            configuration.eventName IN ('AuthorizeSecurityGroupIngress', 'AuthorizeSecurityGroupEgress',
-                                     'RevokeSecurityGroupIngress', 'RevokeSecurityGroupEgress',
-                                     'CreateSecurityGroup', 'DeleteSecurityGroup')
-            OR configurationItemStatus = 'ResourceDeleted'
-        )
-    """
-    return run_config_aggregator_query(query)
-
-def get_user_info_for_change(change):
-    """Query Athena to find who made a specific security group change"""
-    change_time = datetime.strptime(change['configurationItemCaptureTime'], '%Y-%m-%dT%H:%M:%S.%fZ')
-    start_time = (change_time - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-    end_time = (change_time + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
-    
-    query = f"""
-    SELECT
-        eventtime,
-        useridentity.type as identity_type,
-        useridentity.arn as user_arn,
-        useridentity.principalid as principal_id,
-        useridentity.accountid as user_account_id,
-        useridentity.username as username,
-        useridentity.sessioncontext.sessionissuer.arn as assumed_role_arn,
-        eventname,
-        sourceipaddress,
-        useragent
-    FROM {ATHENA_TABLE}
-    WHERE
-        eventtime BETWEEN timestamp '{start_time}' AND timestamp '{end_time}'
-        AND awsregion = '{change['awsRegion']}'
-        AND eventsource = 'ec2.amazonaws.com'
-        AND eventname IN ('AuthorizeSecurityGroupIngress', 'AuthorizeSecurityGroupEgress',
-                         'RevokeSecurityGroupIngress', 'RevokeSecurityGroupEgress',
-                         'CreateSecurityGroup', 'DeleteSecurityGroup')
-        AND NOT (
-            useridentity.type = 'AssumedRole'
-            AND useridentity.sessioncontext.sessionissuer.arn LIKE '%:role/aws-service-role/cloudformation.amazonaws.com/AWSServiceRoleForCloudFormation%'
-        )
-        AND (
-            -- Match by resource ARN pattern
-            regexp_like(resources[1].arn, '.*{change['resourceId']}.*')
-            OR
-            -- Or match by request parameters for some events
-            (
-                json_extract_scalar(requestparameters, '$.groupId') = '{change['resourceId']}'
-                OR json_extract_scalar(requestparameters, '$.groupid') = '{change['resourceId']}'
-                OR json_extract_scalar(requestparameters, '$.groupName') = '{change['resourceId']}'
-            )
-        )
-    ORDER BY eventtime DESC
-    LIMIT 1
-    """
-    
-    output_location = f's3://{OUTPUT_S3_BUCKET}/{OUTPUT_S3_PREFIX}'
-    results = run_athena_query(query, ATHENA_DATABASE, output_location)
-    return results[0] if results else None
-
-def is_cloudformation_event(user_info):
-    """Check if the event was performed by a CloudFormation role"""
-    if not user_info:
-        return False
-    
-    if user_info['identity_type'] == 'AssumedRole':
-        if 'AWSServiceRoleForCloudFormation' in user_info.get('assumed_role_arn', ''):
-            return True
-        if 'cloudformation.amazonaws.com' in user_info.get('assumed_role_arn', ''):
-            return True
-    
-    if user_info['identity_type'] == 'IAMUser':
-        if user_info.get('username', '').startswith('AWSServiceRoleForCloudFormation'):
-            return True
-    
-    return False
-
-def upload_to_s3(file_path, bucket, key):
-    """Upload a file to S3"""
-    s3_client.upload_file(file_path, bucket, key)
-    return f's3://{bucket}/{key}'
-
-def lambda_handler(event, context):
-    print("Starting security group change tracking")
-    print(f"Environment: {json.dumps(os.environ, indent=2)}")
+    # Generate timestamp for the filename
+    timestamp = end_time.strftime('%Y-%m-%d_%H-%M-%S')
+    filename = f'iam_policy_changes_last7days_{timestamp}.csv'
+    s3_key = f'{s3_key_prefix}{filename}'
     
     try:
-        print("Fetching security group changes from AWS Config...")
-        sg_changes = get_security_group_changes()
-        print(f"Found {len(sg_changes)} security group changes to analyze")
+        # Query AWS Config for IAM policy changes in last 7 days
+        response = config_client.select_aggregate_resource_config(
+            Expression=f"""
+                SELECT
+                    resourceId,
+                    resourceType,
+                    configurationItemCaptureTime,
+                    configurationItemStatus,
+                    configurationStateId,
+                    awsAccountId,
+                    awsRegion,
+                    configurationItemDiff
+                WHERE
+                    resourceType = 'AWS::IAM::Policy' AND
+                    configurationItemCaptureTime >= '{start_time_str}' AND
+                    configurationItemCaptureTime <= '{end_time_str}'
+                ORDER BY
+                    configurationItemCaptureTime DESC
+            """,
+            ConfigurationAggregatorName=aggregator_name,
+            Limit=1000  # Adjust based on expected volume
+        )
         
-        results = []
+        # Process the results
+        results = response.get('Results', [])
         
-        for i, change in enumerate(sg_changes):
-            print(f"Processing change {i+1}/{len(sg_changes)}: {change['resourceId']}")
-            
-            try:
-                user_info = get_user_info_for_change(change)
-                if user_info and not is_cloudformation_event(user_info):
-                    combined = {
-                        'resource_id': change['resourceId'],
-                        'region': change['awsRegion'],
-                        'account_id': change['awsAccountId'],
-                        'change_time': change['configurationItemCaptureTime'],
-                        'config_event_name': change.get('configuration.eventName', ''),
-                        **user_info
-                    }
-                    results.append(combined)
-            except Exception as e:
-                print(f"Error processing change {change['resourceId']}: {str(e)}")
-                continue
-        
-        if results:
-            print(f"Saving {len(results)} results to {OUTPUT_CSV_FILE}")
-            df = pd.DataFrame(results)
-            
-            # Reorder columns for better readability
-            column_order = [
-                'resource_id', 'region', 'account_id', 'change_time', 'eventtime',
-                'identity_type', 'user_arn', 'principal_id', 'user_account_id',
-                'username', 'assumed_role_arn', 'eventname', 'sourceipaddress',
-                'useragent', 'config_event_name'
-            ]
-            df = df[[col for col in column_order if col in df.columns]]
-            
-            df.to_csv(OUTPUT_CSV_FILE, index=False, quoting=csv.QUOTE_ALL)
-            
-            # Upload to S3
-            s3_key = f"{OUTPUT_S3_PREFIX}{datetime.now().strftime('%Y-%m-%d')}/security_group_changes.csv"
-            s3_uri = upload_to_s3(OUTPUT_CSV_FILE, OUTPUT_S3_BUCKET, s3_key)
-            
+        if not results:
+            print(f"No IAM policy changes found between {start_time_str} and {end_time_str}.")
             return {
                 'statusCode': 200,
-                'body': {
-                    'message': 'Security group change report generated successfully',
-                    'record_count': len(results),
-                    's3_location': s3_uri
-                }
+                'body': f'No IAM policy changes found between {start_time_str} and {end_time_str}.'
             }
-        else:
-            return {
-                'statusCode': 200,
-                'body': {
-                    'message': 'No security group changes found (after filtering CloudFormation roles)',
-                    'record_count': 0
-                }
-            }
+        
+        # Prepare CSV data
+        csv_rows = []
+        headers = [
+            'AccountID', 'Region', 'ResourceID', 'ResourceType', 
+            'CaptureTime', 'Status', 'StateID', 'ChangeType', 'ChangedProperties'
+        ]
+        
+        for result in results:
+            item = json.loads(result)
+            diff = item.get('configurationItemDiff', {})
+            change_type = diff.get('changeType', 'N/A')
+            changed_properties = ', '.join(diff.get('changedProperties', []))
             
-    except Exception as e:
-        print(f"Error in lambda_handler: {str(e)}")
+            csv_rows.append([
+                item.get('awsAccountId', 'N/A'),
+                item.get('awsRegion', 'N/A'),
+                item.get('resourceId', 'N/A'),
+                item.get('resourceType', 'N/A'),
+                item.get('configurationItemCaptureTime', 'N/A'),
+                item.get('configurationItemStatus', 'N/A'),
+                item.get('configurationStateId', 'N/A'),
+                change_type,
+                changed_properties
+            ])
+        
+        # Write to CSV in memory
+        csv_buffer = []
+        writer = csv.writer(csv_buffer)
+        writer.writerow(headers)
+        writer.writerows(csv_rows)
+        csv_content = '\n'.join(csv_buffer)
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=s3_bucket,
+            Key=s3_key,
+            Body=csv_content
+        )
+        
+        print(f"Successfully saved {len(csv_rows)} IAM policy changes to s3://{s3_bucket}/{s3_key}")
+        print(f"Time range: {start_time_str} to {end_time_str}")
+        
         return {
-            'statusCode': 500,
-            'body': {
-                'message': 'Error generating security group change report',
-                'error': str(e)
+            'statusCode': 200,
+            'body': f"Successfully processed {len(csv_rows)} IAM policy changes from last 7 days.",
+            's3_location': f"s3://{s3_bucket}/{s3_key}",
+            'time_range': {
+                'start': start_time_str,
+                'end': end_time_str
             }
         }
+        
+    except Exception as e:
+        print(f"Error processing IAM policy changes: {str(e)}")
+        raise e
