@@ -3,19 +3,21 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import csv
+import os
+import json
 
 # Initialize AWS clients
 config_client = boto3.client('config')
 athena_client = boto3.client('athena')
 s3_client = boto3.client('s3')
 
-# Configuration
-CONFIG_AGGREGATOR_NAME = 'your-aggregator-name'  # Replace with your Config aggregator name
-ATHENA_DATABASE = 'your_athena_database'         # Replace with your Athena database name
-ATHENA_TABLE = 'cloudtrail_logs'                 # Replace with your CloudTrail table name
-OUTPUT_S3_BUCKET = 'your-output-bucket'          # Replace with your output S3 bucket
-OUTPUT_S3_PREFIX = 'security-group-changes/'     # S3 prefix for Athena results
-OUTPUT_CSV_FILE = 'security_group_changes_with_users.csv'
+# Configuration from environment variables
+CONFIG_AGGREGATOR_NAME = os.environ['CONFIG_AGGREGATOR_NAME']
+ATHENA_DATABASE = os.environ['ATHENA_DATABASE']
+ATHENA_TABLE = os.environ['ATHENA_TABLE']
+OUTPUT_S3_BUCKET = os.environ['OUTPUT_S3_BUCKET']
+OUTPUT_S3_PREFIX = os.getenv('OUTPUT_S3_PREFIX', 'security-group-changes/')
+OUTPUT_CSV_FILE = os.getenv('OUTPUT_CSV_FILE', '/tmp/security_group_changes_with_users.csv')
 
 def run_config_aggregator_query(query):
     """Run query against AWS Config aggregator and return results"""
@@ -170,49 +172,83 @@ def is_cloudformation_event(user_info):
     
     return False
 
-def main():
-    print("Fetching security group changes from AWS Config...")
-    sg_changes = get_security_group_changes()
-    print(f"Found {len(sg_changes)} security group changes to analyze")
-    
-    results = []
-    
-    for i, change in enumerate(sg_changes):
-        print(f"Processing change {i+1}/{len(sg_changes)}: {change['resourceId']}")
-        
-        try:
-            user_info = get_user_info_for_change(change)
-            if user_info and not is_cloudformation_event(user_info):
-                combined = {
-                    'resource_id': change['resourceId'],
-                    'region': change['awsRegion'],
-                    'account_id': change['awsAccountId'],
-                    'change_time': change['configurationItemCaptureTime'],
-                    'config_event_name': change.get('configuration.eventName', ''),
-                    **user_info
-                }
-                results.append(combined)
-        except Exception as e:
-            print(f"Error processing change {change['resourceId']}: {str(e)}")
-            continue
-    
-    if results:
-        print(f"Saving {len(results)} results to {OUTPUT_CSV_FILE}")
-        df = pd.DataFrame(results)
-        
-        # Reorder columns for better readability
-        column_order = [
-            'resource_id', 'region', 'account_id', 'change_time', 'eventtime',
-            'identity_type', 'user_arn', 'principal_id', 'user_account_id',
-            'username', 'assumed_role_arn', 'eventname', 'sourceipaddress',
-            'useragent', 'config_event_name'
-        ]
-        df = df[[col for col in column_order if col in df.columns]]
-        
-        df.to_csv(OUTPUT_CSV_FILE, index=False, quoting=csv.QUOTE_ALL)
-        print("Done!")
-    else:
-        print("No matching events found after filtering CloudFormation roles")
+def upload_to_s3(file_path, bucket, key):
+    """Upload a file to S3"""
+    s3_client.upload_file(file_path, bucket, key)
+    return f's3://{bucket}/{key}'
 
-if __name__ == '__main__':
-    main()
+def lambda_handler(event, context):
+    print("Starting security group change tracking")
+    print(f"Environment: {json.dumps(os.environ, indent=2)}")
+    
+    try:
+        print("Fetching security group changes from AWS Config...")
+        sg_changes = get_security_group_changes()
+        print(f"Found {len(sg_changes)} security group changes to analyze")
+        
+        results = []
+        
+        for i, change in enumerate(sg_changes):
+            print(f"Processing change {i+1}/{len(sg_changes)}: {change['resourceId']}")
+            
+            try:
+                user_info = get_user_info_for_change(change)
+                if user_info and not is_cloudformation_event(user_info):
+                    combined = {
+                        'resource_id': change['resourceId'],
+                        'region': change['awsRegion'],
+                        'account_id': change['awsAccountId'],
+                        'change_time': change['configurationItemCaptureTime'],
+                        'config_event_name': change.get('configuration.eventName', ''),
+                        **user_info
+                    }
+                    results.append(combined)
+            except Exception as e:
+                print(f"Error processing change {change['resourceId']}: {str(e)}")
+                continue
+        
+        if results:
+            print(f"Saving {len(results)} results to {OUTPUT_CSV_FILE}")
+            df = pd.DataFrame(results)
+            
+            # Reorder columns for better readability
+            column_order = [
+                'resource_id', 'region', 'account_id', 'change_time', 'eventtime',
+                'identity_type', 'user_arn', 'principal_id', 'user_account_id',
+                'username', 'assumed_role_arn', 'eventname', 'sourceipaddress',
+                'useragent', 'config_event_name'
+            ]
+            df = df[[col for col in column_order if col in df.columns]]
+            
+            df.to_csv(OUTPUT_CSV_FILE, index=False, quoting=csv.QUOTE_ALL)
+            
+            # Upload to S3
+            s3_key = f"{OUTPUT_S3_PREFIX}{datetime.now().strftime('%Y-%m-%d')}/security_group_changes.csv"
+            s3_uri = upload_to_s3(OUTPUT_CSV_FILE, OUTPUT_S3_BUCKET, s3_key)
+            
+            return {
+                'statusCode': 200,
+                'body': {
+                    'message': 'Security group change report generated successfully',
+                    'record_count': len(results),
+                    's3_location': s3_uri
+                }
+            }
+        else:
+            return {
+                'statusCode': 200,
+                'body': {
+                    'message': 'No security group changes found (after filtering CloudFormation roles)',
+                    'record_count': 0
+                }
+            }
+            
+    except Exception as e:
+        print(f"Error in lambda_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': {
+                'message': 'Error generating security group change report',
+                'error': str(e)
+            }
+        }
